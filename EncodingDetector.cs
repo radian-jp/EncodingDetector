@@ -1,11 +1,35 @@
-﻿using System.Text;
-using System.Globalization;
+﻿using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Text;
 
 /// <summary>
 /// Utility class for decoding byte sequences with unknown encoding by selecting the most natural-looking result.
 /// </summary>
 public static class EncodingDetector
 {
+    private enum KnownCodePages
+    {
+        Utf16LE = 1200,
+        Utf16BE = 1201,
+        Utf32LE = 12000,
+        Utf32BE = 12001,
+    }
+
+    private static readonly Dictionary<KnownCodePages, int> _dicCharSize = new()
+    {
+        { KnownCodePages.Utf16LE, 2 },
+        { KnownCodePages.Utf16BE, 2 },
+        { KnownCodePages.Utf32LE, 4 },
+        { KnownCodePages.Utf32BE, 4 },
+    };
+
+    private static readonly Encoding[] _defaultEncodings = new[]
+    {
+        Encoding.Unicode,
+        new UTF8Encoding(false),
+        Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.ANSICodePage),
+    };
+
     static EncodingDetector()
     {
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
@@ -29,18 +53,22 @@ public static class EncodingDetector
         if (bytes.IsEmpty)
             return string.Empty;
 
-        encodings ??= new[]
+        encodings ??= _defaultEncodings;
+
+        if (encodings != _defaultEncodings)
         {
-            Encoding.Unicode,
-            new UTF8Encoding(false),
-            Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.ANSICodePage),
-        };
+            encodings = encodings
+                .OrderByDescending(e => _dicCharSize.TryGetValue((KnownCodePages)e.CodePage, out var size) ? size : 1)
+                .ToArray();
+        }
 
         string? bestText = null;
         int bestScore = -1;
         foreach (var enc in encodings)
         {
-            var processed = RemoveBomIfPresent(bytes, enc);
+            var tmpBytes = SliceIfNull(bytes, enc);
+
+            var processed = RemoveBomIfPresent(tmpBytes, enc);
             if (!TryDecode(processed, enc, out var text))
                 continue;
 
@@ -79,13 +107,35 @@ public static class EncodingDetector
     /// the method falls back to decoding with <see cref="Encoding.Default"/>.
     /// </returns>
     public static unsafe string DecodeAuto(byte* ptr, int length, Encoding[]? encodings = null)
-    {
-        var span = new Span<byte>(ptr, length);
-        var index = span.IndexOf((byte)0);
-        if (index >= 0)
-            span = span.Slice(0, index);
+        => DecodeAuto(new Span<byte>(ptr, length), encodings);
 
-        return DecodeAuto(span, encodings);
+    private static ReadOnlySpan<byte> SliceIfNull(ReadOnlySpan<byte> bytes, Encoding encoding)
+    {
+        if (!_dicCharSize.TryGetValue((KnownCodePages)encoding.CodePage, out var charSize))
+            charSize = 1;
+
+        switch (charSize)
+        {
+            case 2:
+                {
+                    var charSpan = MemoryMarshal.Cast<byte, char>(bytes);
+                    int index = charSpan.IndexOf('\0');
+                    return index >= 0 ? bytes.Slice(0, index * 2) : bytes;
+                }
+
+            case 4:
+                {
+                    var charSpan = MemoryMarshal.Cast<byte, int>(bytes);
+                    int index = charSpan.IndexOf(0);
+                    return index >= 0 ? bytes.Slice(0, index * charSize) : bytes;
+                }
+
+            default:
+                {
+                    int index = bytes.IndexOf((byte)0);
+                    return index >= 0 ? bytes.Slice(0, index) : bytes;
+                }
+        }
     }
 
     /// <summary>
@@ -142,9 +192,6 @@ public static class EncodingDetector
             // U+E000–U+F8FF: Private Use Area
             if (code >= 0xE000 && code <= 0xF8FF) return true;
 
-            // U+D800–U+DFFF: Surrogate halves
-            //if (code >= 0xD800 && code <= 0xDFFF) return true;
-
             // U+FDD0–U+FDEF and U+FFFE/U+FFFF: Noncharacters
             if ((code >= 0xFDD0 && code <= 0xFDEF) || code == 0xFFFE || code == 0xFFFF) return true;
         }
@@ -168,8 +215,14 @@ public static class EncodingDetector
         {
             if (char.IsLetterOrDigit(c) ||
                 char.IsWhiteSpace(c) ||
-                char.IsPunctuation(c))
+                char.IsPunctuation(c) ||
+                char.IsLowSurrogate(c) ||
+                char.IsHighSurrogate(c)
+            )
+            {
                 readable++;
+
+            }
         }
 
         return readable * 100 / text.Length;
