@@ -53,6 +53,9 @@ public static class EncodingDetector
             {
                 bestScore = score;
                 bestText = text;
+
+                if (score == 100)
+                    break;
             }
         }
 
