@@ -6,6 +6,11 @@ using System.Globalization;
 /// </summary>
 public static class EncodingDetector
 {
+    static EncodingDetector()
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+    }
+
     /// <summary>
     /// Automatically decodes the given byte span using the most natural-looking result
     /// from the specified encoding candidates.
@@ -52,6 +57,32 @@ public static class EncodingDetector
         }
 
         return bestText ?? Encoding.Default.GetString(bytes.ToArray());
+    }
+
+    /// <summary>
+    /// Automatically decodes the given byte span using the most natural-looking result
+    /// from the specified encoding candidates.
+    /// </summary>
+    /// <param name="ptr">Pointer to the beginning of the byte sequence.</param>
+    /// <param name="length">
+    /// The maximum number of bytes in the string pointed to by <paramref name="ptr"/>.
+    /// If a null byte (0x00) is found, decoding stops at that point.
+    /// <param name="encodings">
+    /// Optional array of encoding candidates to try. If null, the method uses:
+    /// UTF-16 (LE), UTF-8 (without BOM), and the system's ANSI code page.
+    /// </param>
+    /// <returns>
+    /// The decoded string that appears most natural. If all candidates are rejected due to garbled characters,
+    /// the method falls back to decoding with <see cref="Encoding.Default"/>.
+    /// </returns>
+    public static unsafe string DecodeAuto(byte* ptr, int length, Encoding[]? encodings = null)
+    {
+        var span = new Span<byte>(ptr, length);
+        var index = span.IndexOf((byte)0);
+        if (index >= 0)
+            span = span.Slice(0, index);
+
+        return DecodeAuto(span, encodings);
     }
 
     /// <summary>
@@ -132,9 +163,9 @@ public static class EncodingDetector
         int readable = 0;
         foreach (var c in text)
         {
-            if(char.IsLetterOrDigit(c) ||
+            if (char.IsLetterOrDigit(c) ||
                 char.IsWhiteSpace(c) ||
-                char.IsPunctuation(c) )
+                char.IsPunctuation(c))
                 readable++;
         }
 
