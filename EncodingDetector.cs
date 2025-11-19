@@ -235,10 +235,7 @@ public static class EncodingDetector
         int kanjiOrSymbolCount = 0;
         foreach (var c in text)
         {
-            if (IsKanji(c))
-                kanjiOrSymbolCount++;
-
-            if (IsAsciiSymbol(c))
+            if (IsKanji(c) || IsAsciiSymbol(c))
                 kanjiOrSymbolCount++;
         }
 
