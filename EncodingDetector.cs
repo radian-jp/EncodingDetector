@@ -7,21 +7,13 @@ using System.Text;
 /// </summary>
 public static class EncodingDetector
 {
-    private enum KnownCodePages
+    private enum CodePages
     {
         Utf16LE = 1200,
         Utf16BE = 1201,
         Utf32LE = 12000,
         Utf32BE = 12001,
     }
-
-    private static readonly Dictionary<KnownCodePages, int> _dicCharSize = new()
-    {
-        { KnownCodePages.Utf16LE, 2 },
-        { KnownCodePages.Utf16BE, 2 },
-        { KnownCodePages.Utf32LE, 4 },
-        { KnownCodePages.Utf32BE, 4 },
-    };
 
     private static readonly Encoding[] _defaultEncodings = new[]
     {
@@ -55,40 +47,49 @@ public static class EncodingDetector
 
         encodings ??= _defaultEncodings;
 
-        if (encodings != _defaultEncodings)
-        {
-            encodings = encodings
-                .OrderByDescending(e => _dicCharSize.TryGetValue((KnownCodePages)e.CodePage, out var size) ? size : 1)
-                .ToArray();
-        }
+        int bytesLen = bytes.Length;
+        int maxCharCount = encodings.Max(e => e.GetMaxCharCount(bytesLen));
+        Span<char> buf = stackalloc char[maxCharCount];
+        Span<char> bestChars = stackalloc char[maxCharCount];
 
-        string? bestText = null;
         int bestScore = -1;
+        int bestCharsLength = 0;
+
         foreach (var enc in encodings)
         {
-            var tmpBytes = SliceIfNull(bytes, enc);
-
-            var processed = RemoveBomIfPresent(tmpBytes, enc);
-            if (!TryDecode(processed, enc, out var text))
+            var processed = RemoveBomIfPresent(bytes, enc);
+            if (!enc.TryGetChars(processed, buf, out var written))
                 continue;
 
-            var chars = text.AsSpan();
+            var chars = buf.Slice(0, written);
             if (ContainsDefinitelyGarbledChar(chars))
                 continue;
 
             int score = ScoreText(chars);
             if (score > bestScore)
             {
+                chars.CopyTo(bestChars);
+                bestCharsLength = written;
                 bestScore = score;
-                bestText = text;
 
                 if (score == 100)
                     break;
             }
         }
 
-        return bestText ?? Encoding.Default.GetString(bytes.ToArray());
+        if (bestCharsLength > 0)
+        {
+            var resultSpan = bestChars.Slice(0, bestCharsLength);
+            int nullIndex = resultSpan.IndexOf('\0');
+            if (nullIndex != -1)
+                resultSpan = resultSpan.Slice(0, nullIndex);
+
+            return new string(resultSpan);
+        }
+
+        return Encoding.Default.GetString(bytes);
     }
+
 
     /// <summary>
     /// Automatically decodes the given byte span using the most natural-looking result
@@ -107,35 +108,37 @@ public static class EncodingDetector
     /// the method falls back to decoding with <see cref="Encoding.Default"/>.
     /// </returns>
     public static unsafe string DecodeAuto(byte* ptr, int length, Encoding[]? encodings = null)
-        => DecodeAuto(new Span<byte>(ptr, length), encodings);
-
-    private static ReadOnlySpan<byte> SliceIfNull(ReadOnlySpan<byte> bytes, Encoding encoding)
     {
-        if (!_dicCharSize.TryGetValue((KnownCodePages)encoding.CodePage, out var charSize))
-            charSize = 1;
 
-        switch (charSize)
+        encodings ??= _defaultEncodings;
+
+        var bytes = SliceNull(new ReadOnlySpan<byte>(ptr, length), encodings);
+
+        return DecodeAuto(bytes, encodings);
+    }
+
+    private static ReadOnlySpan<byte> SliceNull(ReadOnlySpan<byte> bytes, Encoding[] encodings)
+    {
+        int index = bytes.IndexOf((byte)0);
+
+        var codePages = encodings.Select(x => (CodePages)x.CodePage);
+        if (codePages.Contains(CodePages.Utf16LE) || codePages.Contains(CodePages.Utf16BE))
         {
-            case 2:
-                {
-                    var charSpan = MemoryMarshal.Cast<byte, char>(bytes);
-                    int index = charSpan.IndexOf('\0');
-                    return index >= 0 ? bytes.Slice(0, index * 2) : bytes;
-                }
-
-            case 4:
-                {
-                    var charSpan = MemoryMarshal.Cast<byte, int>(bytes);
-                    int index = charSpan.IndexOf(0);
-                    return index >= 0 ? bytes.Slice(0, index * charSize) : bytes;
-                }
-
-            default:
-                {
-                    int index = bytes.IndexOf((byte)0);
-                    return index >= 0 ? bytes.Slice(0, index) : bytes;
-                }
+            var char2Span = MemoryMarshal.Cast<byte, char>(bytes);
+            int index2 = char2Span.IndexOf('\0');
+            index = Math.Max(index2 * 2, index);
         }
+
+        if (codePages.Contains(CodePages.Utf32LE) || codePages.Contains(CodePages.Utf32BE))
+        {
+            var char4Span = MemoryMarshal.Cast<byte, int>(bytes);
+            int index4 = char4Span.IndexOf(0);
+            index = Math.Max(index4 * 4, index);
+        }
+        if (index >= 0)
+            bytes = bytes.Slice(0, index);
+
+        return bytes;
     }
 
     /// <summary>
@@ -154,20 +157,6 @@ public static class EncodingDetector
         return bytes;
     }
 
-    private static bool TryDecode(ReadOnlySpan<byte> bytes, Encoding encoding, out string result)
-    {
-        try
-        {
-            result = encoding.GetString(bytes);
-            return true;
-        }
-        catch
-        {
-            result = string.Empty;
-            return false;
-        }
-    }
-
     /// <summary>
     /// Checks whether the string contains characters that strongly indicate garbled text,
     /// such as replacement characters, control characters, private use area, or invalid Unicode ranges.
@@ -176,32 +165,64 @@ public static class EncodingDetector
     /// <returns><c>true</c> if the string contains garbled characters; otherwise, <c>false</c>.</returns>
     private static bool ContainsDefinitelyGarbledChar(ReadOnlySpan<char> text)
     {
-        foreach (var c in text)
+        for (int i = 0; i < text.Length; i++)
         {
-            int code = c;
+            char c = text[i];
+            if (c == '\0')
+                continue;
 
-            // U+FFFD: Replacement character (�), inserted when decoding fails
-            if (c == '\uFFFD') return true;
+            // Replacement character
+            if (c == '\uFFFD')
+                return true;
 
-            // U+0000–U+001F: C0 control characters
-            if (code >= 0x00 && code <= 0x1F) return true;
+            var category = Char.GetUnicodeCategory(c);
+            if (category == UnicodeCategory.Control ||
+                category == UnicodeCategory.PrivateUse ||
+                category == UnicodeCategory.OtherNotAssigned ||
+                category == UnicodeCategory.Format)
+            {
+                return true;
+            }
 
-            // U+007F: DEL
-            if (code == 0x7F) return true;
-
-            // U+E000–U+F8FF: Private Use Area
-            if (code >= 0xE000 && code <= 0xF8FF) return true;
-
-            // U+FDD0–U+FDEF and U+FFFE/U+FFFF: Noncharacters
-            if ((code >= 0xFDD0 && code <= 0xFDEF) || code == 0xFFFE || code == 0xFFFF) return true;
+            if (category == UnicodeCategory.Surrogate)
+            {
+                // Check if it's a valid surrogate pair
+                if (char.IsHighSurrogate(c))
+                {
+                    if (i + 1 >= text.Length || !char.IsLowSurrogate(text[i + 1]))
+                        return true;
+                    i++; // Skip the low surrogate
+                }
+                else if (char.IsLowSurrogate(c))
+                {
+                    // Low surrogate without preceding high surrogate
+                    return true;
+                }
+            }
         }
 
         return false;
     }
 
+    private static bool IsKanji(char c)
+    {
+        return (c >= '\u4E00' && c <= '\u9FFF') ||
+               (c >= '\u3400' && c <= '\u4DBF') ||
+               (c >= '\uF900' && c <= '\uFAFF');
+    }
+
+    private static bool IsAsciiSymbol(char c)
+    {
+        return c == '\0' ||
+               (c >= 0x21 && c <= 0x2F) ||
+               (c >= 0x3A && c <= 0x40) ||
+               (c >= 0x5B && c <= 0x60) ||
+               (c >= 0x7B && c <= 0x7E);
+    }
+
     /// <summary>
-    /// Scores the naturalness of the string based on the proportion of readable characters
-    /// such as letters, digits, whitespace, and punctuation. Returns a score from 0 to 100.
+    /// It judges the naturalness of a string and returns a score between 0 and 100.
+    /// If the ratio of kanji and symbols is high, the score will be lower.
     /// </summary>
     /// <param name="text">The decoded string to evaluate.</param>
     /// <returns>An integer score representing the naturalness of the string.</returns>
@@ -210,21 +231,21 @@ public static class EncodingDetector
         if (text.Length == 0)
             return 0;
 
-        int readable = 0;
+        const int symbolThreshold = 20;
+        int kanjiOrSymbolCount = 0;
         foreach (var c in text)
         {
-            if (char.IsLetterOrDigit(c) ||
-                char.IsWhiteSpace(c) ||
-                char.IsPunctuation(c) ||
-                char.IsLowSurrogate(c) ||
-                char.IsHighSurrogate(c)
-            )
-            {
-                readable++;
+            if (IsKanji(c))
+                kanjiOrSymbolCount++;
 
-            }
+            if (IsAsciiSymbol(c))
+                kanjiOrSymbolCount++;
         }
 
-        return readable * 100 / text.Length;
+        var symbolPercent = kanjiOrSymbolCount * 100 / text.Length;
+        if (symbolPercent > symbolThreshold)
+            return 100 - symbolPercent;
+
+        return 100;
     }
 }
